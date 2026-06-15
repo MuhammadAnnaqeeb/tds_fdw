@@ -102,6 +102,10 @@ typedef struct TdsFdwRelationInfo
 	ForeignTable *table;
 	ForeignServer *server;
 	UserMapping *user;			/* only set in use_remote_estimate mode */
+
+	/* COUNT(*) pushdown fields */
+	bool		is_pushed_down_agg;
+	Index		baserelid;
 } TdsFdwRelationInfo;
 
 /* this maintains state */
@@ -152,6 +156,9 @@ bool tdsAnalyzeForeignTable(Relation relation, AcquireSampleRowsFunc *func, Bloc
 ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid, ForeignPath *best_path, List *tlist, List *scan_clauses, Plan *outer_plan);
 #else
 ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid, ForeignPath *best_path, List *tlist, List *scan_clauses);
+#endif
+#if (PG_VERSION_NUM >= 90600)
+void tdsGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra);
 #endif
 /* routines for versions older than 9.2.0 */
 #else

@@ -149,7 +149,9 @@ enum FdwScanPrivateIndex
     /* SQL statement to execute remotely (as a String node) */
     FdwScanPrivateSelectSql,
     /* Integer list of attribute numbers retrieved by the SELECT */
-    FdwScanPrivateRetrievedAttrs
+    FdwScanPrivateRetrievedAttrs,
+    /* Foreign table OID */
+    FdwScanPrivateForeignTableId
 };
 
 PG_FUNCTION_INFO_V1(tds_fdw_handler);
@@ -331,6 +333,58 @@ void tdsBuildForeignQuery(PlannerInfo *root, RelOptInfo *baserel, TdsFdwOptionSe
         (errmsg("tds_fdw: Getting query")
         ));
     
+    int64 limit = -1;
+    int64 offset = 0;
+    bool has_const_limit = false;
+    bool has_const_offset = false;
+    
+    if (root && root->parse)
+    {
+        if (root->parse->limitCount)
+        {
+            if (IsA(root->parse->limitCount, Const))
+            {
+                Const *c = (Const *) root->parse->limitCount;
+                if (!c->constisnull)
+                {
+                    if (c->consttype == INT8OID)
+                        limit = DatumGetInt64(c->constvalue);
+                    else if (c->consttype == INT4OID)
+                        limit = DatumGetInt32(c->constvalue);
+                    else if (c->consttype == INT2OID)
+                        limit = DatumGetInt16(c->constvalue);
+                    has_const_limit = true;
+                }
+            }
+        }
+        else
+        {
+            has_const_limit = true;
+        }
+
+        if (root->parse->limitOffset)
+        {
+            if (IsA(root->parse->limitOffset, Const))
+            {
+                Const *c = (Const *) root->parse->limitOffset;
+                if (!c->constisnull)
+                {
+                    if (c->consttype == INT8OID)
+                        offset = DatumGetInt64(c->constvalue);
+                    else if (c->consttype == INT4OID)
+                        offset = DatumGetInt32(c->constvalue);
+                    else if (c->consttype == INT2OID)
+                        offset = DatumGetInt16(c->constvalue);
+                    has_const_offset = true;
+                }
+            }
+        }
+        else
+        {
+            has_const_offset = true;
+        }
+    }
+
     if (option_set->query)
     {
         ereport(DEBUG3,
@@ -345,7 +399,7 @@ void tdsBuildForeignQuery(PlannerInfo *root, RelOptInfo *baserel, TdsFdwOptionSe
 
             initStringInfo(&sql);
             deparseSelectSql(&sql, root, baserel, attrs_used,
-                             retrieved_attrs, option_set);
+                             retrieved_attrs, option_set, -1, 0);
         }
     }
     
@@ -355,7 +409,7 @@ void tdsBuildForeignQuery(PlannerInfo *root, RelOptInfo *baserel, TdsFdwOptionSe
 
         initStringInfo(&sql);
         deparseSelectSql(&sql, root, baserel, attrs_used,
-                         retrieved_attrs, option_set);
+                         retrieved_attrs, option_set, limit, offset);
         if (remote_conds)
             appendWhereClause(&sql, root, baserel, remote_conds,
                               true, NULL);
@@ -363,8 +417,35 @@ void tdsBuildForeignQuery(PlannerInfo *root, RelOptInfo *baserel, TdsFdwOptionSe
             appendWhereClause(&sql, root, baserel, remote_join_conds,
                               (remote_conds == NIL), NULL);
 
-        if (pathkeys)
-            appendOrderByClause(&sql, root, baserel, pathkeys);
+        if (has_const_limit && has_const_offset && (limit >= 0 || offset > 0))
+        {
+            if (offset > 0)
+            {
+                if (pathkeys)
+                {
+                    appendOrderByClause(&sql, root, baserel, pathkeys);
+                    appendStringInfo(&sql, " OFFSET %lld ROWS", (long long) offset);
+                    if (limit >= 0)
+                        appendStringInfo(&sql, " FETCH NEXT %lld ROWS ONLY", (long long) limit);
+                }
+                else
+                {
+                    appendStringInfo(&sql, " ORDER BY (SELECT NULL) OFFSET %lld ROWS", (long long) offset);
+                    if (limit >= 0)
+                        appendStringInfo(&sql, " FETCH NEXT %lld ROWS ONLY", (long long) limit);
+                }
+            }
+            else
+            {
+                if (pathkeys)
+                    appendOrderByClause(&sql, root, baserel, pathkeys);
+            }
+        }
+        else
+        {
+            if (pathkeys)
+                appendOrderByClause(&sql, root, baserel, pathkeys);
+        }
         
         /*
          * Add FOR UPDATE/SHARE if appropriate.  We apply locking during the
@@ -1396,6 +1477,8 @@ void tdsExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
     TdsFdwExecutionState *festate = (TdsFdwExecutionState *) node->fdw_state;
     TdsFdwOptionSet option_set;
+    ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+    Oid relOid = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateForeignTableId));
 
     #ifdef DEBUG
         ereport(NOTICE,
@@ -1403,7 +1486,7 @@ void tdsExplainForeignScan(ForeignScanState *node, ExplainState *es)
             ));
     #endif
 
-    tdsGetForeignTableOptionsFromCatalog(RelationGetRelid(node->ss.ss_currentRelation), &option_set);
+    tdsGetForeignTableOptionsFromCatalog(relOid, &option_set);
 
     if (es->verbose)
     {
@@ -1430,6 +1513,7 @@ void tdsBeginForeignScan(ForeignScanState *node, int eflags)
     TdsFdwExecutionState *festate;
     ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
     EState *estate = node->ss.ps.state;
+    Oid relOid = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateForeignTableId));
     
     #ifdef DEBUG
         ereport(NOTICE,
@@ -1439,7 +1523,7 @@ void tdsBeginForeignScan(ForeignScanState *node, int eflags)
     
     tds_clear_signals();
     
-    tdsGetForeignTableOptionsFromCatalog(RelationGetRelid(node->ss.ss_currentRelation), &option_set);
+    tdsGetForeignTableOptionsFromCatalog(relOid, &option_set);
         
     ereport(DEBUG3,
         (errmsg("tds_fdw: Initiating DB-Library")
@@ -1524,13 +1608,17 @@ void tdsGetColumnMetadata(ForeignScanState *node, TdsFdwOptionSet *option_set)
     char* local_columns_found = NULL;
     TdsFdwExecutionState *festate = (TdsFdwExecutionState *)node->fdw_state;
     int num_retrieved_attrs = list_length(festate->retrieved_attrs);
-    Oid relOid = RelationGetRelid(node->ss.ss_currentRelation);
+    ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+    Oid relOid = intVal(list_nth(fsplan->fdw_private, FdwScanPrivateForeignTableId));
+    TupleDesc tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+    bool is_upper = (fsplan->scan.scanrelid == 0);
+    bool match_column_names = option_set->match_column_names && !is_upper;
 
     old_cxt = MemoryContextSwitchTo(festate->mem_cxt);
 
-    festate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
+    festate->attinmeta = TupleDescGetAttInMetadata(tupdesc);
 
-    if (option_set->match_column_names && festate->ncols < num_retrieved_attrs)
+    if (match_column_names && festate->ncols < num_retrieved_attrs)
     {
         ereport(ERROR,
             (errcode(ERRCODE_FDW_INCONSISTENT_DESCRIPTOR_INFORMATION),
@@ -1541,7 +1629,7 @@ void tdsGetColumnMetadata(ForeignScanState *node, TdsFdwOptionSet *option_set)
             ));
     }
     
-    else if (!option_set->match_column_names && festate->ncols < festate->attinmeta->tupdesc->natts)
+    else if (!match_column_names && festate->ncols < festate->attinmeta->tupdesc->natts)
     {
         ereport(ERROR,
             (errcode(ERRCODE_FDW_INCONSISTENT_DESCRIPTOR_INFORMATION),
@@ -1556,7 +1644,7 @@ void tdsGetColumnMetadata(ForeignScanState *node, TdsFdwOptionSet *option_set)
     festate->datums =  palloc(festate->attinmeta->tupdesc->natts * sizeof(*festate->datums));
     festate->isnull =  palloc(festate->attinmeta->tupdesc->natts * sizeof(*festate->isnull));
 
-    if (option_set->match_column_names)
+    if (match_column_names)
     {
         local_columns_found = palloc0(festate->attinmeta->tupdesc->natts);
     }
@@ -1578,7 +1666,7 @@ void tdsGetColumnMetadata(ForeignScanState *node, TdsFdwOptionSet *option_set)
             (errmsg("tds_fdw: Type is %i", column->srctype)
             ));
 
-        if (option_set->match_column_names)
+        if (match_column_names)
         {
             ListCell   *lc;
         
@@ -1676,7 +1764,7 @@ void tdsGetColumnMetadata(ForeignScanState *node, TdsFdwOptionSet *option_set)
             ));
     }
 
-    if (option_set->match_column_names)
+    if (match_column_names)
     {
         for (ncol = 0; ncol < festate->attinmeta->tupdesc->natts; ncol++)
         {
@@ -2410,6 +2498,31 @@ cleanup_before_init:
     total_cost += fpinfo->fdw_tuple_cost * retrieved_rows;
     total_cost += cpu_tuple_cost * retrieved_rows;
 
+    int64 limit = -1;
+    if (root && root->parse)
+    {
+        if (root->parse->limitCount && IsA(root->parse->limitCount, Const))
+        {
+            Const *c = (Const *) root->parse->limitCount;
+            if (!c->constisnull)
+            {
+                if (c->consttype == INT8OID)
+                    limit = DatumGetInt64(c->constvalue);
+                else if (c->consttype == INT4OID)
+                    limit = DatumGetInt32(c->constvalue);
+                else if (c->consttype == INT2OID)
+                    limit = DatumGetInt16(c->constvalue);
+            }
+        }
+    }
+    if (limit >= 0)
+    {
+        if (rows > limit)
+            rows = limit;
+        if (retrieved_rows > limit)
+            retrieved_rows = limit;
+    }
+
     /* Return results. */
     *p_rows = rows;
     *p_width = width;
@@ -3080,6 +3193,50 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
             local_exprs = lappend(local_exprs, rinfo->clause);
     }
 
+    if (baserel->reloptkind == RELOPT_UPPER_REL)
+    {
+        if (fpinfo && fpinfo->is_pushed_down_agg)
+        {
+            StringInfoData sql;
+            initStringInfo(&sql);
+            deparseSelectAggSql(&sql, root, baserel, fpinfo->baserelid, tlist, &option_set);
+            if (fpinfo->remote_conds)
+                appendWhereClause(&sql, root, baserel, fpinfo->remote_conds, true, NULL);
+                
+            if ((option_set.query = palloc((sql.len + 1) * sizeof(char))) == NULL)
+            {
+                ereport(ERROR,
+                    (errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+                    errmsg("Failed to allocate memory for query")
+                    ));
+            }
+            strcpy(option_set.query, sql.data);
+            
+            fdw_private = list_make3(makeString(option_set.query),
+                                     NIL,
+                                     makeInteger(foreigntableid));
+            
+            #ifdef DEBUG
+                ereport(NOTICE,
+                    (errmsg("----> finishing tdsGetForeignPlan")
+                    ));
+            #endif
+            
+            #if (PG_VERSION_NUM >= 90500)
+            return make_foreignscan(tlist,
+                                    local_exprs,
+                                    scan_relid,
+                                    params_list,
+                                    fdw_private,
+                                    NIL,    /* no custom tlist */
+                                    remote_exprs,
+                                    outer_plan);
+            #else
+            return make_foreignscan(tlist, local_exprs, scan_relid, params_list, fdw_private);
+            #endif
+        }
+    }
+
     /*
      * Build the query string to be sent for execution, and identify
      * expressions to be sent as parameters.
@@ -3093,8 +3250,9 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
      * Build the fdw_private list that will be available to the executor.
      * Items in the list must match enum FdwScanPrivateIndex, above.
      */
-    fdw_private = list_make2(makeString(option_set.query),
-                             retrieved_attrs);
+    fdw_private = list_make3(makeString(option_set.query),
+                             retrieved_attrs,
+                             makeInteger(foreigntableid));
 
     /*
      * Create the ForeignScan node from target list, filtering expressions,

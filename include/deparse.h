@@ -55,7 +55,12 @@ deparseSelectSql(StringInfo buf,
 				 RelOptInfo *baserel,
 				 Bitmapset *attrs_used,
 				 List **retrieved_attrs,
-				 TdsFdwOptionSet* option_set);
+				 TdsFdwOptionSet* option_set,
+				 int64 limit_count,
+				 int64 limit_offset);
+
+void deparseSelectAggSql(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel, Index baserelid,
+                         List *targetExprs, TdsFdwOptionSet* option_set);
 				 
 /*
  * deparse remote INSERT statement

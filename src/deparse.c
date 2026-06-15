@@ -166,6 +166,7 @@ static void deparseRelabelType(RelabelType *node, deparse_expr_cxt *context);
 static void deparseBoolExpr(BoolExpr *node, deparse_expr_cxt *context);
 static void deparseNullTest(NullTest *node, deparse_expr_cxt *context);
 static void deparseArrayExpr(ArrayExpr *node, deparse_expr_cxt *context);
+static void deparseAggref(Aggref *node, deparse_expr_cxt *context);
 static void printRemoteParam(int paramindex, Oid paramtype, int32 paramtypmod,
 				 deparse_expr_cxt *context);
 static void printRemotePlaceholder(Oid paramtype, int32 paramtypmod,
@@ -736,7 +737,9 @@ deparseSelectSql(StringInfo buf,
 				 RelOptInfo *baserel,
 				 Bitmapset *attrs_used,
 				 List **retrieved_attrs,
-				 TdsFdwOptionSet* option_set)
+				 TdsFdwOptionSet* option_set,
+				 int64 limit_count,
+				 int64 limit_offset)
 {
 	RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
 	Relation	rel;
@@ -754,13 +757,72 @@ deparseSelectSql(StringInfo buf,
 	/*
 	 * Construct SELECT list
 	 */
-	appendStringInfoString(buf, "SELECT ");
+	if (limit_count >= 0 && limit_offset == 0)
+	{
+		appendStringInfo(buf, "SELECT TOP %lld ", (long long) limit_count);
+	}
+	else
+	{
+		appendStringInfoString(buf, "SELECT ");
+	}
 	deparseTargetList(buf, root, baserel->relid, rel, attrs_used,
 					  retrieved_attrs, option_set);
 
 	/*
 	 * Construct FROM clause
 	 */
+	appendStringInfoString(buf, " FROM ");
+	deparseRelation(buf, rel);
+
+	#if PG_VERSION_NUM < 120000
+	heap_close(rel, NoLock);
+	#else
+	table_close(rel, NoLock);
+	#endif
+}
+
+void
+deparseSelectAggSql(StringInfo buf,
+                    PlannerInfo *root,
+                    RelOptInfo *baserel,
+                    Index baserelid,
+                    List *targetExprs,
+                    TdsFdwOptionSet* option_set)
+{
+	RangeTblEntry *rte = planner_rt_fetch(baserelid, root);
+	Relation	rel;
+	deparse_expr_cxt context;
+	ListCell   *lc;
+	bool        first = true;
+	RelOptInfo *baserel_base = find_base_rel(root, baserelid);
+
+	#if PG_VERSION_NUM < 120000
+	rel = heap_open(rte->relid, NoLock);
+	#else
+	rel = table_open(rte->relid, NoLock);
+	#endif
+
+	appendStringInfoString(buf, "SELECT ");
+
+	context.root = root;
+	context.foreignrel = baserel_base;
+	context.buf = buf;
+	context.params_list = NULL;
+
+	foreach(lc, targetExprs)
+	{
+		Expr *expr = (Expr *) lfirst(lc);
+		
+		if (IsA(expr, TargetEntry))
+			expr = ((TargetEntry *) expr)->expr;
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		deparseExpr(expr, &context);
+	}
+
 	appendStringInfoString(buf, " FROM ");
 	deparseRelation(buf, rel);
 
@@ -1350,10 +1412,38 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 		case T_ArrayExpr:
 			deparseArrayExpr((ArrayExpr *) node, context);
 			break;
+		case T_Aggref:
+			deparseAggref((Aggref *) node, context);
+			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
 				 (int) nodeTag(node));
 			break;
+	}
+}
+
+static void
+deparseAggref(Aggref *node, deparse_expr_cxt *context)
+{
+	StringInfo buf = context->buf;
+	char *funcname = get_func_name(node->aggfnoid);
+
+	if (funcname && strcmp(funcname, "count") == 0)
+	{
+		if (node->aggstar || node->args == NIL)
+		{
+			appendStringInfoString(buf, "COUNT(*)");
+		}
+		else
+		{
+			appendStringInfoString(buf, "COUNT(");
+			deparseExpr((Expr *) linitial(node->args), context);
+			appendStringInfoString(buf, ")");
+		}
+	}
+	else
+	{
+		elog(ERROR, "unsupported aggregate function for deparse: %s", funcname ? funcname : "(null)");
 	}
 }
 
