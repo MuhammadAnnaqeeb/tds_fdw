@@ -5,3 +5,4 @@ sql/*--*.sql
 *.bc
 *.so
 tests/lib/__pycache__
+.aider*
