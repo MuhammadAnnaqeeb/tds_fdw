@@ -35,6 +35,7 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #if PG_VERSION_NUM < 180000
@@ -73,6 +74,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/planmain.h"
+#include "utils/lsyscache.h"
 
 /* DB-Library headers (e.g. FreeTDS */
 #include <sybfront.h>
@@ -178,6 +180,10 @@ PGDLLEXPORT Datum tds_fdw_handler(PG_FUNCTION_ARGS)
     
     fdwroutine->ExplainForeignScan = tdsExplainForeignScan;
     fdwroutine->BeginForeignScan = tdsBeginForeignScan;
+    #if (PG_VERSION_NUM >= 90600)
+    fdwroutine->GetForeignUpperPaths = tdsGetForeignUpperPaths;
+    #endif
+
     fdwroutine->IterateForeignScan = tdsIterateForeignScan;
     fdwroutine->ReScanForeignScan = tdsReScanForeignScan;
     fdwroutine->EndForeignScan = tdsEndForeignScan;
@@ -4485,8 +4491,121 @@ int tds_chkintr_func(void *vdbproc)
     return status;
 }
 
-int tds_hndlintr_func(void *vdbproc)
+static int tds_hndlintr_func(void *vdbproc)
 {
     tds_clear_signals();
     return INT_CANCEL;
 }
+
+#if (PG_VERSION_NUM >= 90600)
+/*
+ * tdsGetForeignUpperPaths
+ *		Add ForeignPath for pushed-down aggregates (COUNT) and set estimates.
+ *		Called when the planner encounters an upper relation (UPPERREL_GROUP_AGG).
+ */
+void
+tdsGetForeignUpperPaths(PlannerInfo *root,
+                        UpperRelationKind stage,
+                        RelOptInfo *input_rel,
+                        RelOptInfo *output_rel,
+                        void *extra)
+{
+    TdsFdwRelationInfo *fpinfo_input;
+    TdsFdwRelationInfo *fpinfo_output;
+    GroupPathExtraData *extra_data = (GroupPathExtraData *) extra;
+    double		rows = 1.0;
+    int			width = 0;
+    Cost		startup_cost;
+    Cost		total_cost;
+    bool		can_pushdown_agg = false;
+    ListCell   *lc;
+    TdsFdwOptionSet option_set;
+    Oid			foreign_table_oid;
+
+    ereport(DEBUG2, (errmsg("tds_fdw: checking for pushdown aggregate")));
+
+    /* Only handle GROUP_AGG stage for now */
+    if (stage != UPPERREL_GROUP_AGG)
+        return;
+
+    fpinfo_input = (TdsFdwRelationInfo *) input_rel->fdw_private;
+    if (!fpinfo_input)
+        return;
+
+    /* Check if input is a direct foreign table scan (single base relation) */
+    if (input_rel->relid == 0)
+        return;
+
+    /* Validate aggregates: only COUNT(*), COUNT(1), COUNT(col) supported */
+    foreach(lc, extra_data->targetList)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (IsA(tle->expr, Aggref))
+        {
+            Aggref	   *aggref = (Aggref *) tle->expr;
+            char	   *func_name = get_func_name(aggref->aggfnoid);
+
+            if (func_name && strcmp(func_name, "count") == 0)
+            {
+                /* COUNT is supported */
+                can_pushdown_agg = true;
+            }
+            else
+            {
+                /* Other aggregates not supported yet */
+                ereport(DEBUG3,
+                    (errmsg("tds_fdw: aggregate %s not supported for pushdown",
+                             func_name ? func_name : "(unknown)")));
+                return;
+            }
+        }
+        else if (!IsA(tle->expr, Var))
+        {
+            /* GROUP BY expressions must be simple Vars or aggregate functions */
+            if (!IsA(tle->expr, Const) && !is_foreign_expr(root, input_rel, tle->expr))
+                return;
+        }
+    }
+
+    if (!can_pushdown_agg)
+        return;
+
+    /* Retrieve FDW options */
+    foreign_table_oid = input_rel->relid;
+    if (!OidIsValid(foreign_table_oid))
+        return;
+
+    tdsGetForeignTableOptionsFromCatalog(foreign_table_oid, &option_set);
+    /* Skip if custom query is set */
+    if (option_set.query)
+        return;
+
+    /* Cost: aggregate is cheap on remote, return is 1 row or few rows */
+    startup_cost = fpinfo_input->startup_cost;
+    total_cost = fpinfo_input->total_cost + 10;	/* Small additional cost for aggregation */
+    rows = 1.0;		 /* COUNT returns 1 row */
+    width = 16;		 /* INT8 result */
+
+    /* Create output relation info */
+    fpinfo_output = (TdsFdwRelationInfo *) palloc0(sizeof(TdsFdwRelationInfo));
+    fpinfo_output->is_pushed_down_agg = true;
+    fpinfo_output->baserelid = input_rel->relid;
+    fpinfo_output->rows = rows;
+    fpinfo_output->width = width;
+    fpinfo_output->startup_cost = startup_cost;
+    fpinfo_output->total_cost = total_cost;
+    fpinfo_output->table = GetForeignTable(foreign_table_oid);
+    fpinfo_output->server = GetForeignServer(fpinfo_output->table->serverid);
+    fpinfo_output->user = GetUserMapping(GetUserId(), fpinfo_output->server->serverid);
+
+    output_rel->fdw_private = fpinfo_output;
+
+    /* Add a ForeignPath */
+    add_path(output_rel, (Path *)
+             create_foreign_upper_path(root, output_rel, output_rel->reltarget,
+                                      rows, startup_cost, total_cost, NIL,
+                                      NULL, NIL));
+
+    ereport(DEBUG2, (errmsg("tds_fdw: added foreign upper path for COUNT aggregate")));
+}
+#endif
