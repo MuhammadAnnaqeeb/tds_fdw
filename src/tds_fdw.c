@@ -2557,6 +2557,7 @@ void tdsGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntab
      */
     fpinfo = (TdsFdwRelationInfo *) palloc0(sizeof(TdsFdwRelationInfo));
     baserel->fdw_private = (void *) fpinfo;
+    fpinfo->baserelid = baserel->relid;
 
     /* Look up foreign-table catalog info. */
     fpinfo->table = GetForeignTable(foreigntableid);
@@ -4587,15 +4588,20 @@ tdsGetForeignUpperPaths(PlannerInfo *root,
         return;
 
     /* Cost: aggregate is cheap on remote, return is 1 row or few rows */
-    startup_cost = fpinfo_input->startup_cost;
-    total_cost = fpinfo_input->total_cost + 10;	/* Small additional cost for aggregation */
+    /*
+     * A pushed-down aggregate should be cheaper than fetching all rows and
+     * aggregating locally; otherwise the planner will keep the local Aggregate
+     * node even when the remote side can compute COUNT().
+     */
+    startup_cost = fpinfo_input->fdw_startup_cost;
+    total_cost = startup_cost + fpinfo_input->fdw_tuple_cost + cpu_tuple_cost;
     rows = 1.0;		 /* COUNT returns 1 row */
     width = 16;		 /* INT8 result */
 
     /* Create output relation info */
     fpinfo_output = (TdsFdwRelationInfo *) palloc0(sizeof(TdsFdwRelationInfo));
     fpinfo_output->is_pushed_down_agg = true;
-    fpinfo_output->baserelid = input_rel->relid;
+    fpinfo_output->baserelid = fpinfo_input->baserelid;
     fpinfo_output->rows = rows;
     fpinfo_output->width = width;
     fpinfo_output->startup_cost = startup_cost;
