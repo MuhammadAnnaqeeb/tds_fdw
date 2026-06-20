@@ -2558,6 +2558,7 @@ void tdsGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntab
     fpinfo = (TdsFdwRelationInfo *) palloc0(sizeof(TdsFdwRelationInfo));
     baserel->fdw_private = (void *) fpinfo;
     fpinfo->baserelid = baserel->relid;
+    fpinfo->foreign_table_oid = foreigntableid;
 
     /* Look up foreign-table catalog info. */
     fpinfo->table = GetForeignTable(foreigntableid);
@@ -3207,7 +3208,7 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
         {
             StringInfoData sql;
             initStringInfo(&sql);
-            deparseSelectAggSql(&sql, root, baserel, fpinfo->baserelid, tlist, &option_set);
+            deparseSelectAggSql(&sql, root, baserel, fpinfo->foreign_table_oid, tlist, &option_set);
             if (fpinfo->remote_conds)
                 appendWhereClause(&sql, root, baserel, fpinfo->remote_conds, true, NULL);
                 
@@ -3222,7 +3223,7 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
             
             fdw_private = list_make3(makeString(option_set.query),
                                      NIL,
-                                     makeInteger(foreigntableid));
+                                     makeInteger(fpinfo->foreign_table_oid));
             
             #ifdef DEBUG
                 ereport(NOTICE,
@@ -3260,7 +3261,7 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
      */
     fdw_private = list_make3(makeString(option_set.query),
                              retrieved_attrs,
-                             makeInteger(foreigntableid));
+                             makeInteger(fpinfo->foreign_table_oid));
 
     /*
      * Create the ForeignScan node from target list, filtering expressions,

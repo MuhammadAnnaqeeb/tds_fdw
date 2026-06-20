@@ -785,27 +785,25 @@ void
 deparseSelectAggSql(StringInfo buf,
                     PlannerInfo *root,
                     RelOptInfo *baserel,
-                    Index baserelid,
+                    Oid foreign_table_oid,
                     List *targetExprs,
                     TdsFdwOptionSet* option_set)
 {
-	RangeTblEntry *rte = planner_rt_fetch(baserelid, root);
 	Relation	rel;
 	deparse_expr_cxt context;
 	ListCell   *lc;
 	bool        first = true;
-	RelOptInfo *baserel_base = find_base_rel(root, baserelid);
 
 	#if PG_VERSION_NUM < 120000
-	rel = heap_open(rte->relid, NoLock);
+	rel = heap_open(foreign_table_oid, NoLock);
 	#else
-	rel = table_open(rte->relid, NoLock);
+	rel = table_open(foreign_table_oid, NoLock);
 	#endif
 
 	appendStringInfoString(buf, "SELECT ");
 
 	context.root = root;
-	context.foreignrel = baserel_base;
+	context.foreignrel = baserel;
 	context.buf = buf;
 	context.params_list = NULL;
 

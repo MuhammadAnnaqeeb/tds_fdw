@@ -99,6 +99,7 @@ typedef struct TdsFdwRelationInfo
 	//List	   *shippable_extensions;	/* OIDs of whitelisted extensions */
 
 	/* Cached catalog information. */
+	Oid			foreign_table_oid;
 	ForeignTable *table;
 	ForeignServer *server;
 	UserMapping *user;			/* only set in use_remote_estimate mode */
@@ -192,6 +193,7 @@ bool is_shippable(Oid objectId, Oid classId, TdsFdwRelationInfo *fpinfo);
 void tdsBuildForeignQuery(PlannerInfo *root, RelOptInfo *baserel, TdsFdwOptionSet* option_set,
 	Bitmapset* attrs_used, List** retrieved_attrs, 
 	List* remote_conds, List* remote_join_conds, List* pathkeys);
+void deparseSelectAggSql(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel, Oid foreign_table_oid, List *targetExprs, TdsFdwOptionSet* option_set);
 int tdsSetupConnection(TdsFdwOptionSet* option_set, LOGINREC *login, DBPROCESS **dbproc);
 double tdsGetRowCount(TdsFdwOptionSet* option_set, LOGINREC *login, DBPROCESS *dbproc);
 double tdsGetRowCountShowPlanAll(TdsFdwOptionSet* option_set, LOGINREC *login, DBPROCESS *dbproc);
