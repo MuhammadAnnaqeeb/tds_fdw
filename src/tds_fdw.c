@@ -57,6 +57,7 @@
 #else
 #include "optimizer/optimizer.h"
 #endif
+#include "parser/parsetree.h"
 #include "storage/fd.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -4521,6 +4522,7 @@ tdsGetForeignUpperPaths(PlannerInfo *root,
     ListCell   *lc;
     TdsFdwOptionSet option_set;
     Oid			foreign_table_oid;
+    RangeTblEntry *rte;
 
     ereport(DEBUG2, (errmsg("tds_fdw: checking for pushdown aggregate")));
 
@@ -4571,7 +4573,11 @@ tdsGetForeignUpperPaths(PlannerInfo *root,
         return;
 
     /* Retrieve FDW options */
-    foreign_table_oid = input_rel->relid;
+    if (input_rel->relid == 0)
+        return;
+
+    rte = planner_rt_fetch(input_rel->relid, root);
+    foreign_table_oid = rte->relid;
     if (!OidIsValid(foreign_table_oid))
         return;
 
