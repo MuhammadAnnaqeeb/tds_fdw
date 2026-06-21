@@ -219,6 +219,9 @@ void tdsGetForeignTableOptionsFromCatalog(Oid foreigntableid, TdsFdwOptionSet* o
     #endif
     
     tdsOptionSetInit(option_set);
+
+    if (!OidIsValid(foreigntableid))
+        return;
     
     f_table = GetForeignTable(foreigntableid);
     f_server = GetForeignServer(f_table->serverid);
@@ -1068,4 +1071,3 @@ void tdsOptionSetInit(TdsFdwOptionSet* option_set)
             ));
     #endif  
 }
-

@@ -57,6 +57,7 @@
 #else
 #include "optimizer/optimizer.h"
 #endif
+#include "nodes/makefuncs.h"
 #include "parser/parsetree.h"
 #include "storage/fd.h"
 #include "utils/array.h"
@@ -2560,11 +2561,18 @@ void tdsGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntab
     fpinfo->baserelid = baserel->relid;
     fpinfo->foreign_table_oid = foreigntableid;
 
+    /* Upper relations can arrive here with a dummy OID; skip catalog lookups. */
+    if (!OidIsValid(foreigntableid))
+        return;
+
     /* Look up foreign-table catalog info. */
     fpinfo->table = GetForeignTable(foreigntableid);
     fpinfo->server = GetForeignServer(fpinfo->table->serverid);
     
-    tdsGetForeignTableOptionsFromCatalog(foreigntableid, &option_set);
+    if (baserel->reloptkind == RELOPT_UPPER_REL && fpinfo)
+        tdsGetForeignTableOptionsFromCatalog(fpinfo->foreign_table_oid, &option_set);
+    else
+        tdsGetForeignTableOptionsFromCatalog(foreigntableid, &option_set);
     
     fpinfo->use_remote_estimate = option_set.use_remote_estimate;
     fpinfo->fdw_startup_cost = option_set.fdw_startup_cost;
@@ -3206,11 +3214,24 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
     {
         if (fpinfo && fpinfo->is_pushed_down_agg)
         {
+            RelOptInfo *base_rel = find_base_rel(root, fpinfo->baserelid);
+            List *scan_tlist;
+            tdsGetForeignTableOptionsFromCatalog(fpinfo->foreign_table_oid, &option_set);
             StringInfoData sql;
             initStringInfo(&sql);
             deparseSelectAggSql(&sql, root, baserel, fpinfo->foreign_table_oid, tlist, &option_set);
             if (fpinfo->remote_conds)
-                appendWhereClause(&sql, root, baserel, fpinfo->remote_conds, true, NULL);
+                appendWhereClause(&sql, root, base_rel, fpinfo->remote_conds, true, NULL);
+
+            scan_tlist = list_make1(makeTargetEntry((Expr *) makeVar(INDEX_VAR,
+                                                                     1,
+                                                                     INT8OID,
+                                                                     -1,
+                                                                     InvalidOid,
+                                                                     false),
+                                                    1,
+                                                    NULL,
+                                                    false));
                 
             if ((option_set.query = palloc((sql.len + 1) * sizeof(char))) == NULL)
             {
@@ -3220,6 +3241,8 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
                     ));
             }
             strcpy(option_set.query, sql.data);
+            ereport(NOTICE,
+                    (errmsg("tds_fdw count pushdown SQL: %s", option_set.query)));
             
             fdw_private = list_make3(makeString(option_set.query),
                                      NIL,
@@ -3232,12 +3255,12 @@ ForeignScan* tdsGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
             #endif
             
             #if (PG_VERSION_NUM >= 90500)
-            return make_foreignscan(tlist,
+            return make_foreignscan(scan_tlist,
                                     local_exprs,
                                     scan_relid,
                                     params_list,
                                     fdw_private,
-                                    NIL,    /* no custom tlist */
+                                    scan_tlist,
                                     remote_exprs,
                                     outer_plan);
             #else
@@ -4575,14 +4598,10 @@ tdsGetForeignUpperPaths(PlannerInfo *root,
         return;
 
     /* Retrieve FDW options */
-    if (input_rel->relid == 0)
+    if (!OidIsValid(fpinfo_input->foreign_table_oid))
         return;
 
-    rte = planner_rt_fetch(input_rel->relid, root);
-    foreign_table_oid = rte->relid;
-    if (!OidIsValid(foreign_table_oid))
-        return;
-
+    foreign_table_oid = fpinfo_input->foreign_table_oid;
     tdsGetForeignTableOptionsFromCatalog(foreign_table_oid, &option_set);
     /* Skip if custom query is set */
     if (option_set.query)
@@ -4603,11 +4622,12 @@ tdsGetForeignUpperPaths(PlannerInfo *root,
     fpinfo_output = (TdsFdwRelationInfo *) palloc0(sizeof(TdsFdwRelationInfo));
     fpinfo_output->is_pushed_down_agg = true;
     fpinfo_output->baserelid = fpinfo_input->baserelid;
+    fpinfo_output->foreign_table_oid = fpinfo_input->foreign_table_oid;
     fpinfo_output->rows = rows;
     fpinfo_output->width = width;
     fpinfo_output->startup_cost = startup_cost;
     fpinfo_output->total_cost = total_cost;
-    fpinfo_output->table = GetForeignTable(foreign_table_oid);
+    fpinfo_output->table = GetForeignTable(fpinfo_input->foreign_table_oid);
     fpinfo_output->server = GetForeignServer(fpinfo_output->table->serverid);
     fpinfo_output->user = GetUserMapping(GetUserId(), fpinfo_output->server->serverid);
 
